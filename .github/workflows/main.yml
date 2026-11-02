@@ -3,8 +3,6 @@ on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
-permissions:
-  contents: write
 concurrency: try-pricer
 jobs:
   run:
@@ -16,14 +14,20 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - name: restore memory
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
       - run: pip install -r requirements.txt
       - run: python bot.py
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-      - name: save state
-        run: |
-          git config user.name "try-pricer"
-          git config user.email "bot@users.noreply.github.com"
-          git add state.json || true
-          git diff --cached --quiet || (git commit -m "state" && git pull --rebase -X theirs origin main && git push)
+      - name: save memory
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}

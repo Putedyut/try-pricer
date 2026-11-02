@@ -1,7 +1,7 @@
 {
-  "funpay_url": "ВСТАВЬ_ССЫЛКУ_НА_КАТЕГОРИЮ_PSN_ТУРЦИЯ_НА_FUNPAY",
+  "funpay_url": "https://funpay.com/lots/935/",
   "rt_urls": {
-    "250": "ВСТАВЬ_ССЫЛКУ_НА_КАРТУ_250_TRY_НА_igrovoy.rt.ru",
+    "250": "https://igrovoy.rt.ru/catalog/refill?system_activations=playstation&sort=relevant&activation_regions=29&page=1",
     "500": "",
     "1000": "",
     "1500": "",

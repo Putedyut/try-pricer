@@ -1,102 +1,295 @@
 """TRY Прайсер — бот для перепродажи карт PSN Турция.
-Запускается GitHub Actions по расписанию: забирает цены FunPay и Ростелеком Игр,
-считает цену для лота и пишет в Telegram, когда рекомендация меняется.
+
+GitHub Actions запускает его раз в 10 минут. Бот:
+  1) читает новые сообщения боту (команда «цены» / /prices, и запоминает твой chat id);
+  2) забирает цены конкурентов с FunPay и цену закупки с Ростелеком Игр;
+  3) считает, какую цену ставить в лоте;
+  4) пишет в Telegram: сводку при ручном запуске, по команде и раз в день,
+     а в остальное время — только когда цену пора менять.
+Бот никогда не падает с ошибкой: любая проблема приходит тебе сообщением и печатается в лог.
 """
-import json, math, os, re, sys, html, time
-from datetime import datetime, timezone, timedelta
+import html
+import json
+import math
+import os
+import re
+import sys
+import time
+import traceback
+from datetime import datetime, timedelta, timezone
+
 import requests
 from bs4 import BeautifulSoup
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-CFG = json.load(open(os.path.join(ROOT, "config.json"), encoding="utf-8"))
 STATE_PATH = os.path.join(ROOT, "state.json")
-TOKEN = os.environ.get("TG_TOKEN", "")
-CHAT = os.environ.get("TG_CHAT_ID", "")
 MSK = timezone(timedelta(hours=3))
+TOKEN = os.environ.get("TG_TOKEN", "").strip()
+ENV_CHAT = os.environ.get("TG_CHAT_ID", "").strip()
+MANUAL = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
-    "Accept-Language": "ru-RU,ru;q=0.9",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5",
 }
-DENOMS = [int(d) for d in CFG["denominations"]]
+FUNPAY_COOKIES = {"cy": "rub", "locale": "ru"}
+
+DEFAULT_CFG = {
+    "funpay_urls": [],
+    "rt_urls": {},
+    "rt_fallback_cost": {"250": 403, "500": 804, "1000": 1609, "1500": 2414, "2000": 3218, "2500": 4022},
+    "denominations": [250, 500, 1000, 1500, 2000, 2500],
+    "my_nick": "",
+    "funpay_fee_pct": 13.03,
+    "withdraw_pct": 3,
+    "tax_pct": 0,
+    "undercut_rub": 2,
+    "min_margin_pct": 2,
+    "skip_bots": True,
+    "bot_stock_threshold": 10000,
+    "notify_on_change_rub": 1,
+    "daily_summary_hour_msk": 10,
+}
 
 
-def num(s):
-    s = re.sub(r"[\s  ]", "", str(s)).replace(",", ".")
+def log(*a):
+    print(*a, flush=True)
+
+
+# ---------------- настройки и память ----------------
+def load_cfg():
     try:
-        return float(s)
-    except ValueError:
-        return None
+        with open(os.path.join(ROOT, "config.json"), encoding="utf-8") as f:
+            user = json.load(f)
+    except Exception as e:
+        return dict(DEFAULT_CFG), f"config.json не читается ({e}). Проверь кавычки и запятые."
+    cfg = dict(DEFAULT_CFG)
+    cfg.update(user)
+    if "funpay_url" in user and not user.get("funpay_urls"):
+        cfg["funpay_urls"] = user["funpay_url"]
+    return cfg, None
 
 
 def load_state():
     try:
-        return json.load(open(STATE_PATH, encoding="utf-8"))
+        with open(STATE_PATH, encoding="utf-8") as f:
+            st = json.load(f)
     except Exception:
-        return {"last": {}, "tg_offset": 0, "last_summary": "", "rt_cost": {}}
+        st = {}
+    st.setdefault("last", {})
+    st.setdefault("tg_offset", 0)
+    st.setdefault("last_summary", "")
+    st.setdefault("rt_cost", {})
+    st.setdefault("chat_id", "")
+    return st
 
 
 def save_state(st):
-    json.dump(st, open(STATE_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=1)
 
 
-def tg(text):
-    if not TOKEN or not CHAT:
-        print("[no telegram]\n" + text)
-        return
-    for chunk in [text[i:i + 3900] for i in range(0, len(text), 3900)]:
-        r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                          json={"chat_id": CHAT, "text": chunk, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=20)
-        print("tg", r.status_code)
+def as_list(v):
+    if isinstance(v, str):
+        v = [v]
+    if not isinstance(v, list):
+        return []
+    return [x.strip() for x in v if isinstance(x, str) and x.strip().startswith("http")]
 
 
-def denom_from(text):
-    found = [num(m) for m in re.findall(r"(\d[\d\s ]{0,6}\d|\d)\s*(?:TRY|TL|лир)", text, re.I)]
-    found = [int(x) for x in found if x and int(x) in DENOMS]
-    return found[-1] if found else None
+def num(s):
+    if s is None:
+        return None
+    s = re.sub(r"[\s  ]", "", str(s)).replace(",", ".")
+    m = re.search(r"\d+(?:\.\d+)?", s)
+    return float(m.group(0)) if m else None
 
 
-# ---------- FunPay ----------
-def parse_funpay(page):
+def rub(v):
+    return f"{v:,.0f}".replace(",", " ") + " ₽"
+
+
+# ---------------- Telegram ----------------
+def tg_api(method, **params):
+    r = requests.post(f"https://api.telegram.org/bot{TOKEN}/{method}", json=params, timeout=25)
+    try:
+        data = r.json()
+    except Exception:
+        data = {"ok": False, "description": r.text[:200]}
+    return r.status_code, data
+
+
+def read_messages(st):
+    """Новые сообщения боту. Запоминает chat id того, кто пишет боту, и ловит команду «цены»."""
+    if not TOKEN:
+        return False
+    try:
+        code, data = tg_api("getUpdates", offset=st["tg_offset"], timeout=0)
+    except Exception as e:
+        log("getUpdates: Telegram недоступен:", e)
+        return False
+    if code != 200:
+        log(f"getUpdates ошибка {code}: {data.get('description')}")
+        return False
+    asked = False
+    for u in data.get("result", []):
+        st["tg_offset"] = u["update_id"] + 1
+        msg = u.get("message") or u.get("edited_message") or {}
+        chat = msg.get("chat") or {}
+        if chat.get("type") != "private":
+            continue
+        cid = str(chat.get("id", ""))
+        if cid:
+            if st.get("chat_id") != cid:
+                log(f"Нашёл твой chat id по сообщению боту: {cid}")
+            st["chat_id"] = cid
+        text = (msg.get("text") or "").lower()
+        if any(k in text for k in ("/prices", "/start", "цен", "price")):
+            asked = True
+    return asked
+
+
+def send(st, text):
+    """Отправляет сообщение. Сначала в TG_CHAT_ID, при ошибке — в чат, из которого тебе писали боту."""
+    if not TOKEN:
+        log("НЕТ TG_TOKEN: добавь секрет TG_TOKEN в Settings → Secrets and variables → Actions → Secrets.")
+        log(text)
+        return False
+    targets = []
+    for c in (ENV_CHAT, st.get("chat_id", "")):
+        if c and c not in targets:
+            targets.append(c)
+    if not targets:
+        log("НЕ ЗНАЮ, КУДА ПИСАТЬ: напиши своему боту в Telegram слово «цены» и запусти Run workflow ещё раз.")
+        return False
+    chunks = [text[i:i + 3800] for i in range(0, len(text), 3800)]
+    for chat in targets:
+        ok = True
+        for ch in chunks:
+            try:
+                code, data = tg_api("sendMessage", chat_id=chat, text=ch, parse_mode="HTML", disable_web_page_preview=True)
+                if code == 400 and "parse" in str(data.get("description", "")).lower():
+                    plain = re.sub(r"<[^>]+>", "", ch)
+                    code, data = tg_api("sendMessage", chat_id=chat, text=html.unescape(plain), disable_web_page_preview=True)
+            except Exception as e:
+                log("Telegram недоступен:", e)
+                return False
+            if code != 200:
+                ok = False
+                desc = str(data.get("description", ""))
+                log(f"Telegram ОШИБКА {code} для чата {chat}: {desc}")
+                if code == 401:
+                    log("→ Неверный TG_TOKEN. Скопируй токен заново у @BotFather и обнови секрет.")
+                    return False
+                if "bots" in desc:
+                    log("→ В TG_CHAT_ID стоит id бота. Нужен ТВОЙ id из @userinfobot (или просто удали секрет TG_CHAT_ID и напиши боту «цены»).")
+                elif code == 403:
+                    log("→ Открой своего бота в Telegram, нажми «Старт» и напиши «цены».")
+                elif code == 400:
+                    log("→ Неверный TG_CHAT_ID. Напиши боту «цены» — бот сам узнает твой чат.")
+                break
+        if ok:
+            log(f"Telegram: сообщение отправлено в чат {chat} ✅")
+            if chat != ENV_CHAT:
+                st["chat_id"] = chat
+            return True
+    return False
+
+
+# ---------------- FunPay ----------------
+def denom_from(text, denoms):
+    vals = []
+    for m in re.findall(r"(\d[\d\s ]{0,6}\d|\d)\s*(?:TRY|TL|₺|лир)", text, re.I):
+        v = num(m)
+        if v and int(v) in denoms:
+            vals.append(int(v))
+    return vals[-1] if vals else None
+
+
+def parse_funpay_html(page, denoms):
     soup = BeautifulSoup(page, "html.parser")
     lots = {}
     items = soup.select("a.tc-item") or soup.select(".tc-item")
     for it in items:
-        desc = it.select_one(".tc-desc-text") or it.select_one(".tc-desc") or it
-        d = denom_from(desc.get_text(" ", strip=True)) or denom_from(it.get_text(" ", strip=True))
+        full = it.get_text(" ", strip=True)
+        desc_el = it.select_one(".tc-desc-text") or it.select_one(".tc-desc")
+        d = (denom_from(desc_el.get_text(" ", strip=True), denoms) if desc_el else None) or denom_from(full, denoms)
         if not d:
             continue
-        price_el = it.select_one(".tc-price")
         price = None
-        if price_el is not None:
-            price = num(price_el.get("data-s")) if price_el.get("data-s") else None
-            if price is None:
-                m = re.search(r"(\d[\d\s ]*(?:[.,]\d{1,2})?)", price_el.get_text(" ", strip=True))
-                price = num(m.group(1)) if m else None
-        if not price or price < 50:
+        pe = it.select_one(".tc-price")
+        if pe is not None:
+            price = num(pe.get("data-s")) or num(pe.get_text(" ", strip=True))
+        if not price:
             continue
-        seller_el = it.select_one(".media-user-name") or it.select_one(".tc-user")
-        seller = seller_el.get_text(" ", strip=True).split()[0] if seller_el else "?"
-        amount_el = it.select_one(".tc-amount")
-        stock = num(amount_el.get_text("", strip=True)) if amount_el else 0
+        se = it.select_one(".media-user-name") or it.select_one(".tc-user")
+        seller = se.get_text(" ", strip=True).split()[0] if se and se.get_text(strip=True) else "?"
+        ae = it.select_one(".tc-amount")
+        stock = num(ae.get_text("", strip=True)) if ae else 0
         lots.setdefault(d, []).append({"p": price, "s": seller, "q": stock or 0})
-    for d in lots:
-        lots[d].sort(key=lambda x: x["p"])
     return lots, len(items)
 
 
-def fetch_funpay():
-    url = CFG["funpay_url"]
-    if not url.startswith("http"):
-        raise RuntimeError("В config.json не указана ссылка funpay_url")
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    return parse_funpay(r.text)
+def parse_funpay_text(page, denoms):
+    """Запасной разбор: по тексту страницы, если разметка FunPay поменялась."""
+    text = BeautifulSoup(page, "html.parser").get_text("\n", strip=True).replace(" ", " ")
+    lots, last, n = {}, 0, 0
+    for m in re.finditer(r"(\d+(?:[.,]\d{1,2})?)\s*₽", text):
+        chunk = text[last:m.start()]
+        last = m.end()
+        d = denom_from(chunk, denoms)
+        if not d:
+            continue
+        price = num(m.group(1))
+        qm = re.search(r"(\d{1,3}(?: \d{3})+|\d+)\s*$", chunk)
+        stock = num(qm.group(1)) if qm else 0
+        lines = [x.strip() for x in chunk.split("\n") if x.strip()]
+        seller = "?"
+        for i, l in enumerate(lines):
+            if "на сайте" in l.lower():
+                for k in range(i - 1, -1, -1):
+                    if re.fullmatch(r"[\w.\-]{2,30}", lines[k]) and not lines[k].isdigit():
+                        seller = lines[k]
+                        break
+                break
+        lots.setdefault(d, []).append({"p": price, "s": seller, "q": stock or 0})
+        n += 1
+    return lots, n
 
 
-# ---------- Ростелеком Игры ----------
+def fetch_funpay(cfg):
+    urls = as_list(cfg.get("funpay_urls"))
+    if not urls:
+        raise RuntimeError("в config.json не вписана ссылка на FunPay (funpay_urls)")
+    denoms = [int(x) for x in cfg["denominations"]]
+    lots, total = {}, 0
+    for url in urls:
+        r = requests.get(url, headers=HEADERS, cookies=FUNPAY_COOKIES, timeout=30)
+        log(f"FunPay {url} → HTTP {r.status_code}, {len(r.text)} символов")
+        r.raise_for_status()
+        part, n = parse_funpay_html(r.text, denoms)
+        if not part:
+            part, n = parse_funpay_text(r.text, denoms)
+            log(f"FunPay: разметка не узнана, разобрал по тексту: {n} лотов")
+        total += n
+        for d, arr in part.items():
+            lots.setdefault(d, []).extend(arr)
+        time.sleep(1)
+    for d in list(lots):
+        seen, uniq = set(), []
+        for x in sorted(lots[d], key=lambda x: x["p"]):
+            key = (x["s"], x["p"])
+            if key not in seen:
+                seen.add(key)
+                uniq.append(x)
+        lots[d] = uniq
+    return lots, total
+
+
+# ---------------- Ростелеком Игры ----------------
 def parse_rt_price(page):
     soup = BeautifulSoup(page, "html.parser")
-    # 1) структурированные данные (JSON-LD / meta)
     for s in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(s.string or "")
@@ -111,142 +304,159 @@ def parse_rt_price(page):
                 stack.extend(x.values())
             elif isinstance(x, list):
                 stack.extend(x)
-    meta = soup.find("meta", attrs={"itemprop": "price"}) or soup.find("meta", attrs={"property": "product:price:amount"})
-    if meta and num(meta.get("content")):
-        return num(meta.get("content"))
-    # 2) первая цена в ₽ после названия карты
-    text = soup.get_text(" ", strip=True)
-    m = re.search(r"play\s*station\s*store\s*[\d\s ]{3,7}\s*TRY.{0,200}?(\d[\d\s ]{1,8})\s*₽", text, re.I | re.S)
-    if m:
-        return num(m.group(1))
-    return None
+    for attrs in ({"itemprop": "price"}, {"property": "product:price:amount"}):
+        meta = soup.find(attrs=attrs)
+        if meta is not None and num(meta.get("content")):
+            return num(meta.get("content"))
+    text = soup.get_text(" ", strip=True).replace(" ", " ").replace(" ", " ")
+    m = re.search(r"play\s*station\s*store\s*[\d ]{3,7}\s*TRY.{0,250}?(\d[\d ]{1,8})\s*₽", text, re.I | re.S)
+    return num(m.group(1)) if m else None
 
 
-def fetch_rt(st):
+def fetch_rt(cfg, st):
     costs, notes = {}, []
-    for d in DENOMS:
-        url = CFG["rt_urls"].get(str(d), "")
-        price = None
-        if url.startswith("http"):
+    for d in [int(x) for x in cfg["denominations"]]:
+        urls = as_list(cfg.get("rt_urls", {}).get(str(d)))
+        found, err = [], None
+        for url in urls:
             try:
                 r = requests.get(url, headers=HEADERS, timeout=30)
+                log(f"РИ {d} TRY → HTTP {r.status_code}")
                 r.raise_for_status()
-                price = parse_rt_price(r.text)
+                p = parse_rt_price(r.text)
+                if p and p > 50:
+                    found.append(p)
             except Exception as e:
-                notes.append(f"{d} TRY: РИ не открылась ({type(e).__name__})")
-        if price:
-            costs[d] = price
-            st["rt_cost"][str(d)] = price
+                err = type(e).__name__
+        if found:
+            costs[d] = min(found)
+            st["rt_cost"][str(d)] = costs[d]
         else:
-            costs[d] = st["rt_cost"].get(str(d)) or CFG["rt_fallback_cost"].get(str(d))
-            if url.startswith("http"):
-                notes.append(f"{d} TRY: цену РИ не нашёл, беру {costs[d]} ₽")
+            costs[d] = st["rt_cost"].get(str(d)) or cfg["rt_fallback_cost"].get(str(d))
+            if urls:
+                why = f"сайт не открылся ({err})" if err else "цену на странице не нашёл"
+                notes.append(f"{d} TRY: РИ — {why}, считаю по {rub(costs[d])}")
     return costs, notes
 
 
-# ---------- расчёт ----------
-def calc(d, cost, lots):
-    fee = CFG["funpay_fee_pct"] / 100
-    wd = CFG["withdraw_pct"] / 100
-    tax = CFG["tax_pct"] / 100
-    nick = CFG["my_nick"].lower()
-    rivals = [x for x in lots.get(d, []) if x["s"].lower() != nick]
-    if CFG["skip_bots"]:
-        live = [x for x in rivals if x["q"] < CFG["bot_stock_threshold"]]
+# ---------------- расчёт ----------------
+def calc(cfg, d, cost, lots):
+    if not cost:
+        return None
+    fee = cfg["funpay_fee_pct"] / 100
+    wd = cfg["withdraw_pct"] / 100
+    tax = cfg["tax_pct"] / 100
+    nick = str(cfg.get("my_nick", "")).strip().lower()
+    all_lots = lots.get(d, [])
+    mine = [x for x in all_lots if nick and x["s"].lower() == nick]
+    rivals = [x for x in all_lots if not (nick and x["s"].lower() == nick)]
+    if cfg.get("skip_bots"):
+        live = [x for x in rivals if x["q"] < cfg["bot_stock_threshold"]]
         rivals = live or rivals
-    mine = [x for x in lots.get(d, []) if x["s"].lower() == nick]
-    if not rivals or not cost:
+    if not rivals:
         return None
     ref = rivals[0]
-    buyer = ref["p"] - CFG["undercut_rub"]
-    lot = round(buyer / (1 + fee))
-    min_lot = math.ceil(cost * (1 + CFG["min_margin_pct"] / 100) / ((1 - wd) * (1 - tax)))
-    status = "✅ Ставь" if lot >= min_lot else ("🟡 Тонко" if lot * (1 - wd) * (1 - tax) > cost else "⛔️ Не закупай")
-    rec = lot if lot * (1 - wd) * (1 - tax) > cost else min_lot
-    profit = rec * (1 - wd) * (1 - tax) - cost
-    return {"d": d, "cost": cost, "ref": ref, "lot": rec, "buyer": round(rec * (1 + fee), 2), "profit": profit,
-            "margin": profit / cost, "min_lot": min_lot, "status": status, "mine": mine[0]["p"] if mine else None}
-
-
-def rub(v):
-    return f"{v:,.0f}".replace(",", " ") + " ₽"
+    keep = (1 - wd) * (1 - tax)
+    lot = round((ref["p"] - cfg["undercut_rub"]) / (1 + fee))
+    min_lot = math.ceil(cost * (1 + cfg["min_margin_pct"] / 100) / keep)
+    if lot >= min_lot:
+        status, rec = "✅ Ставь", lot
+    elif lot * keep > cost:
+        status, rec = "🟡 Тонко", lot
+    else:
+        status, rec = "⛔️ Не закупай", min_lot
+    profit = rec * keep - cost
+    return {"d": d, "cost": cost, "ref": ref, "lot": rec, "buyer": rec * (1 + fee), "profit": profit,
+            "margin": profit / cost, "min_lot": min_lot, "status": status,
+            "mine": round(mine[0]["p"] / (1 + fee)) if mine else None}
 
 
 def fmt(r):
     me = ""
-    if r["mine"]:
-        my_lot = round(r["mine"] / (1 + CFG["funpay_fee_pct"] / 100))
-        me = f"\n   сейчас у тебя {rub(my_lot)}" + (" — поменяй" if my_lot != r["lot"] else " — ок")
-    return (f"<b>{r['d']} TRY</b> {r['status']}\n"
-            f"   ставь <b>{rub(r['lot'])}</b> → покупатель {r['buyer']:.2f} ₽\n"
-            f"   прибыль {r['profit']:+.0f} ₽ ({r['margin']*100:.1f}%), не ниже {rub(r['min_lot'])}\n"
-            f"   ориентир: {html.escape(r['ref']['s'])} {r['ref']['p']} ₽{me}")
+    if r["mine"] is not None:
+        me = f"\n   у тебя сейчас {rub(r['mine'])}" + (" — ок" if r["mine"] == r["lot"] else " — <b>поменяй</b>")
+    return (f"<b>{r['d']} TRY</b> · {r['status']}\n"
+            f"   ставь <b>{rub(r['lot'])}</b> (покупатель увидит {r['buyer']:.2f} ₽)\n"
+            f"   прибыль {r['profit']:+.0f} ₽ · {r['margin'] * 100:.1f}% · не ниже {rub(r['min_lot'])}\n"
+            f"   ориентир: {html.escape(r['ref']['s'])} — {r['ref']['p']:g} ₽{me}")
 
 
 def summary(res, notes):
     now = datetime.now(MSK).strftime("%d.%m %H:%M")
-    body = "\n\n".join(fmt(r) for r in res)
-    tail = ("\n\n⚠️ " + "\n⚠️ ".join(notes)) if notes else ""
+    body = "\n\n".join(fmt(r) for r in res) if res else "Нет данных ни по одному номиналу."
+    tail = ("\n\n⚠️ " + "\n⚠️ ".join(html.escape(n) for n in notes)) if notes else ""
     return f"🇹🇷 <b>PSN Турция — цены</b> · {now} МСК\n\n{body}{tail}"
 
 
-def check_commands(st):
-    """Читает новые сообщения боту. /prices или «цены» — прислать полную сводку."""
-    if not TOKEN:
-        return False
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates",
-                         params={"offset": st.get("tg_offset", 0), "timeout": 0}, timeout=20).json()
-    except Exception:
-        return False
-    want = False
-    for u in r.get("result", []):
-        st["tg_offset"] = u["update_id"] + 1
-        msg = u.get("message") or {}
-        text = (msg.get("text") or "").lower()
-        if str(msg.get("chat", {}).get("id")) == str(CHAT) and any(k in text for k in ("/prices", "/start", "цены", "цена")):
-            want = True
-    return want
+# ---------------- главный цикл ----------------
+def run(st):
+    cfg, cfg_err = load_cfg()
+    asked = read_messages(st)
+    save_state(st)
+    if cfg_err:
+        send(st, "⚠️ " + html.escape(cfg_err))
+        return
+    denoms = [int(x) for x in cfg["denominations"]]
 
-
-def main():
-    st = load_state()
-    st.setdefault("rt_cost", {})
-    asked = check_commands(st)
-    notes = []
     try:
-        lots, n_items = fetch_funpay()
+        lots, n_items = fetch_funpay(cfg)
     except Exception as e:
-        tg(f"⚠️ Не смог открыть FunPay: {html.escape(str(e))[:300]}")
-        save_state(st)
+        send(st, f"⚠️ FunPay: {html.escape(str(e))[:300]}")
         return
     if not lots:
-        tg(f"⚠️ FunPay открылся, но лоты не распознаны (элементов на странице: {n_items}). Пришли этот текст Claude — поправит парсер.")
-        save_state(st)
+        send(st, f"⚠️ FunPay открылся, но лоты с номиналами {', '.join(map(str, denoms))} TRY не найдены "
+                 f"(элементов на странице: {n_items}). Проверь ссылку или пришли лог Claude.")
         return
-    costs, rt_notes = fetch_rt(st)
-    notes += rt_notes
-    res = [r for r in (calc(d, costs[d], lots) for d in DENOMS) if r]
+
+    costs, notes = fetch_rt(cfg, st)
+    res, missing = [], []
+    for d in denoms:
+        r = calc(cfg, d, costs.get(d), lots)
+        (res.append(r) if r else missing.append(str(d)))
+    if missing:
+        notes.append(f"нет лотов конкурентов на FunPay для: {', '.join(missing)} TRY")
+    for r in res:
+        log(f"{r['d']} TRY: ставь {r['lot']} ₽, прибыль {r['profit']:+.0f} ₽, ориентир {r['ref']['s']} {r['ref']['p']}")
 
     changes = []
     for r in res:
         prev = st["last"].get(str(r["d"]))
-        if prev is None or abs(prev["lot"] - r["lot"]) >= CFG["notify_on_change_rub"] or prev["status"] != r["status"]:
-            if prev is not None:
-                changes.append(f"<b>{r['d']} TRY</b>: {rub(prev['lot'])} → <b>{rub(r['lot'])}</b> {r['status']}\n"
-                               f"   ориентир {html.escape(r['ref']['s'])} {r['ref']['p']} ₽, прибыль {r['profit']:+.0f} ₽")
-        st["last"][str(r["d"])] = {"lot": r["lot"], "status": r["status"]}
+        if prev and (abs(prev["lot"] - r["lot"]) >= cfg["notify_on_change_rub"] or prev["status"] != r["status"]):
+            changes.append(f"<b>{r['d']} TRY</b>: {rub(prev['lot'])} → <b>{rub(r['lot'])}</b> · {r['status']}\n"
+                           f"   ориентир {html.escape(r['ref']['s'])} — {r['ref']['p']:g} ₽, прибыль {r['profit']:+.0f} ₽")
 
     now = datetime.now(MSK)
-    day_key = now.strftime("%Y-%m-%d")
-    daily = now.hour >= CFG["daily_summary_hour_msk"] and st.get("last_summary") != day_key
-    if asked or daily or not st.get("last_summary"):
-        tg(summary(res, notes))
-        if daily or not st.get("last_summary"):
-            st["last_summary"] = day_key
+    today = now.strftime("%Y-%m-%d")
+    daily_due = now.hour >= cfg["daily_summary_hour_msk"] and st.get("last_summary") != today
+    first = not st.get("last_summary")
+    if MANUAL or asked or daily_due or first:
+        sent = send(st, summary(res, notes))
     elif changes:
-        tg("🔔 <b>Пора поменять цену</b>\n\n" + "\n\n".join(changes))
+        sent = send(st, "🔔 <b>Пора поменять цену</b>\n\n" + "\n\n".join(changes))
+    else:
+        log("Цены не изменились — сообщение не нужно.")
+        sent = True
+    if sent:
+        if MANUAL or asked or daily_due or first:
+            st["last_summary"] = today
+        for r in res:
+            st["last"][str(r["d"])] = {"lot": r["lot"], "status": r["status"]}
+
+
+def main():
+    st = load_state()
     save_state(st)
+    try:
+        run(st)
+    except Exception as e:
+        log(traceback.format_exc())
+        try:
+            send(st, f"⚠️ Бот споткнулся: {html.escape(type(e).__name__)}: {html.escape(str(e))[:300]}")
+        except Exception:
+            pass
+    finally:
+        save_state(st)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,23 @@
+{
+  "funpay_url": "ВСТАВЬ_ССЫЛКУ_НА_КАТЕГОРИЮ_PSN_ТУРЦИЯ_НА_FUNPAY",
+  "rt_urls": {
+    "250": "ВСТАВЬ_ССЫЛКУ_НА_КАРТУ_250_TRY_НА_igrovoy.rt.ru",
+    "500": "",
+    "1000": "",
+    "1500": "",
+    "2000": "",
+    "2500": ""
+  },
+  "rt_fallback_cost": {"250": 403, "500": 804, "1000": 1609, "1500": 2414, "2000": 3218, "2500": 4022},
+  "denominations": [250, 500, 1000, 1500, 2000, 2500],
+  "my_nick": "Putedag",
+  "funpay_fee_pct": 13.03,
+  "withdraw_pct": 3,
+  "tax_pct": 0,
+  "undercut_rub": 2,
+  "min_margin_pct": 2,
+  "skip_bots": true,
+  "bot_stock_threshold": 10000,
+  "notify_on_change_rub": 1,
+  "daily_summary_hour_msk": 10
+}

@@ -1,15 +1,14 @@
 {
   "funpay_urls": [
-    "ССЫЛКА_FUNPAY_1",
-    "ССЫЛКА_FUNPAY_2"
+    "https://funpay.com/lots/935/"
   ],
   "rt_urls": {
-    "250": ["ССЫЛКА_РИ_250_TRY"],
-    "500": [],
-    "1000": [],
-    "1500": [],
-    "2000": [],
-    "2500": []
+    "250": ["https://igrovoy.rt.ru/catalog/refill/145/card-karta-popolneniya-playstation-store-turtsiya-250-try-playstation"],
+    "500": ["https://igrovoy.rt.ru/catalog/refill/100338/card-karta-oplaty-playstation-store-500-try-turcia-psn-tr"],
+    "1000": ["https://igrovoy.rt.ru/catalog/refill/100341/card-karta-oplaty-playstation-store-1000-try-turcia-psn-tr"],
+    "1500": ["https://igrovoy.rt.ru/catalog/refill/100343/card-karta-oplaty-playstation-store-1500-try-turcia-psn-tr"],
+    "2000": ["https://igrovoy.rt.ru/catalog/refill/100342/card-karta-oplaty-playstation-store-2000-try-turcia-psn-tr"],
+    "2500": ["https://igrovoy.rt.ru/catalog/refill/100049/card-karta-oplaty-playstation-store-2500-try-turcia-psn-tr"]
   },
   "rt_fallback_cost": {"250": 403, "500": 804, "1000": 1609, "1500": 2414, "2000": 3218, "2500": 4022},
   "denominations": [250, 500, 1000, 1500, 2000, 2500],

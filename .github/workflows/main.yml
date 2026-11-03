@@ -3,13 +3,19 @@ on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
+permissions:
+  contents: write
 concurrency: try-pricer
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: get latest ledger
+        run: git pull --ff-only origin main || true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -25,9 +31,23 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          LEDGER_KEY: ${{ secrets.LEDGER_KEY }}
       - name: save memory
         if: always()
         uses: actions/cache/save@v4
         with:
           path: state.json
           key: state-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: save ledger
+        if: always()
+        run: |
+          git config user.name "try-pricer"
+          git config user.email "bot@users.noreply.github.com"
+          git add ledger.enc 2>/dev/null || true
+          if git diff --cached --quiet; then echo "журнал не менялся"; exit 0; fi
+          git commit -m "ledger"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push && exit 0
+            sleep 5
+          done
+          echo "не смог сохранить журнал в репозиторий"; exit 1

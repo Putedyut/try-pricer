@@ -12,21 +12,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
+      - name: remember start time
+        run: echo "START=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           ref: main
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
       - name: restore memory
         uses: actions/cache/restore@v4
         with:
           path: state.json
           key: state-${{ github.run_id }}
           restore-keys: state-
-      - run: pip install -r requirements.txt
-      - run: python bot.py
+      - name: install
+        run: pip install requests==2.32.3 beautifulsoup4==4.12.3 cryptography==43.0.3
+      - name: bot
+        run: python bot.py
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
@@ -41,4 +44,10 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run "${{ github.workflow }}" --ref main --repo "${{ github.repository }}"
+        run: |
+          ELAPSED=$(( $(date +%s) - START ))
+          if [ "$ELAPSED" -lt 180 ]; then
+            echo "Запуск упал быстро ($ELAPSED c) — следующий не запускаю, чтобы не было цикла. Хочешь — смотри лог шага bot."
+            exit 0
+          fi
+          gh workflow run "${{ github.workflow }}" --ref main --repo "${{ github.repository }}"
